@@ -87,6 +87,21 @@ codegen: $(QJSC)
 debug:
 	BUILD_TYPE=Debug $(MAKE)
 
+YK_BUILD_DIR=build-yk
+YK_CONFIG?=$(HOME)/yk/bin/yk-config
+YK_CC=$(shell $(YK_CONFIG) release --cc)
+
+yk-build:
+	cmake -B $(YK_BUILD_DIR) \
+	    -DCMAKE_BUILD_TYPE=Debug \
+	    -DCMAKE_C_COMPILER="$(YK_CC)" \
+	    -DUSE_YK=ON \
+	    -DQJS_BUILD_WERROR=OFF
+	cmake --build $(YK_BUILD_DIR) --target qjs_exe -j $(JOBS)
+
+yk-clean:
+	$(RM) -rf $(YK_BUILD_DIR)
+
 distclean:
 	@rm -rf $(BUILD_DIR)
 

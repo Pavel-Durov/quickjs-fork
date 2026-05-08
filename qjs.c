@@ -40,6 +40,10 @@
 #include <mimalloc.h>
 #endif
 
+#ifdef USE_YK
+#include "yk.h"
+#endif
+
 extern const uint8_t qjsc_repl[];
 extern const uint32_t qjsc_repl_size;
 extern const uint8_t qjsc_standalone[];
@@ -395,8 +399,14 @@ void help(void)
     exit(1);
 }
 
+#ifdef USE_YK
+__attribute__((visibility("default")))
+#endif
 int main(int argc, char **argv)
 {
+#ifdef USE_YK
+    yk_init();
+#endif
     JSRuntime *rt;
     JSContext *ctx;
     JSValue ret = JS_UNDEFINED;

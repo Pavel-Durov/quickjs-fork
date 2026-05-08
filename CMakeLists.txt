@@ -244,6 +244,23 @@ add_link_options(
 )
 endif()
 
+if(USE_YK)
+message(STATUS "Building with yk JIT integration")
+find_program(YK_CONFIG yk-config HINTS "$ENV{HOME}/yk/bin" REQUIRED)
+execute_process(COMMAND ${YK_CONFIG} release --cppflags OUTPUT_VARIABLE YK_CPPFLAGS OUTPUT_STRIP_TRAILING_WHITESPACE)
+execute_process(COMMAND ${YK_CONFIG} release --cflags  OUTPUT_VARIABLE YK_CFLAGS   OUTPUT_STRIP_TRAILING_WHITESPACE)
+execute_process(COMMAND ${YK_CONFIG} release --ldflags OUTPUT_VARIABLE YK_LDFLAGS  OUTPUT_STRIP_TRAILING_WHITESPACE)
+execute_process(COMMAND ${YK_CONFIG} release --libs    OUTPUT_VARIABLE YK_LIBS     OUTPUT_STRIP_TRAILING_WHITESPACE)
+separate_arguments(YK_CPPFLAGS_LIST UNIX_COMMAND "${YK_CPPFLAGS}")
+separate_arguments(YK_CFLAGS_LIST   UNIX_COMMAND "${YK_CFLAGS}")
+separate_arguments(YK_LDFLAGS_LIST  UNIX_COMMAND "${YK_LDFLAGS} ${YK_LIBS}")
+# USE_YK is defined globally (harmless preprocessor flag for non-yk targets).
+# -fuse-ld=lld is applied globally so that any target linking against the
+# LTO-bitcode libqjs.a uses lld (system ld cannot read LTO bitcode).
+# The full yk compile/link passes are scoped to qjs, qjsc, and qjs_exe below.
+add_compile_definitions(USE_YK)
+add_link_options(-fuse-ld=lld)
+endif()
 
 # QuickJS library
 #
@@ -305,6 +322,9 @@ target_include_directories(qjs PUBLIC
     $<INSTALL_INTERFACE:${CMAKE_INSTALL_INCLUDEDIR}>
 )
 target_link_libraries(qjs PUBLIC ${qjs_libs})
+if(USE_YK)
+    target_compile_options(qjs PRIVATE ${YK_CPPFLAGS_LIST} ${YK_CFLAGS_LIST})
+endif()
 
 # Pass a compiler definition so that Windows gets its declspec's right.
 get_target_property(QJS_LIB_TYPE qjs TYPE)
@@ -367,6 +387,10 @@ add_qjs_libc_if_needed(qjsc)
 add_static_if_needed(qjsc)
 target_compile_definitions(qjsc PRIVATE ${qjs_defines})
 target_link_libraries(qjsc PRIVATE qjs)
+if(USE_YK)
+    target_compile_options(qjsc PRIVATE ${YK_CPPFLAGS_LIST} ${YK_CFLAGS_LIST})
+    target_link_options(qjsc PRIVATE ${YK_LDFLAGS_LIST})
+endif()
 
 
 # QuickJS CLI
@@ -384,6 +408,10 @@ set_target_properties(qjs_exe PROPERTIES
 )
 target_compile_definitions(qjs_exe PRIVATE ${qjs_defines})
 target_link_libraries(qjs_exe PRIVATE qjs)
+if(USE_YK)
+    target_compile_options(qjs_exe PRIVATE ${YK_CPPFLAGS_LIST} ${YK_CFLAGS_LIST})
+    target_link_options(qjs_exe PRIVATE ${YK_LDFLAGS_LIST})
+endif()
 if (NOT WIN32)
     set_target_properties(qjs_exe PROPERTIES ENABLE_EXPORTS TRUE)
 endif()

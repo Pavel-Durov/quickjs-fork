@@ -393,6 +393,9 @@ static void check_hasarg(int optind, int argc, int opt)
     }
 }
 
+#ifdef USE_YK
+__attribute__((visibility("default")))
+#endif
 int main(int argc, char **argv)
 {
     int optind = 1;

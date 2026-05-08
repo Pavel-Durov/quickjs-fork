@@ -54,6 +54,12 @@
 #define DIRECT_DISPATCH  1
 #endif
 
+#ifdef USE_YK
+#undef DIRECT_DISPATCH
+#define DIRECT_DISPATCH 0
+#include "yk.h"
+#endif
+
 #if defined(__APPLE__)
 #define MALLOC_OVERHEAD  0
 #else
@@ -342,6 +348,10 @@ struct JSRuntime {
 
     bool can_block; /* true if Atomics.wait can block */
     uint32_t dump_flags : 24;
+
+#ifdef USE_YK
+    YkMT *ykmt;
+#endif
 
     /* Shape hash table */
     int shape_hash_bits;
@@ -801,6 +811,9 @@ typedef struct JSFunctionBytecode {
     int pc2line_len;
     uint8_t *pc2line_buf;
     char *source;
+#ifdef USE_YK
+    YkLocation *yklocs; /* one per byte in byte_code_buf; loop heads are non-null */
+#endif
 } JSFunctionBytecode;
 
 typedef struct JSBoundFunction {
@@ -1185,9 +1198,9 @@ static JSValue js_call_c_function(JSContext *ctx, JSValueConst func_obj,
 static JSValue js_call_bound_function(JSContext *ctx, JSValueConst func_obj,
                                       JSValueConst this_obj,
                                       int argc, JSValueConst *argv, int flags);
-static JSValue JS_CallInternal(JSContext *ctx, JSValueConst func_obj,
-                               JSValueConst this_obj, JSValueConst new_target,
-                               int argc, JSValueConst *argv, int flags);
+JSValue JS_CallInternal(JSContext *ctx, JSValueConst func_obj,
+                       JSValueConst this_obj, JSValueConst new_target,
+                       int argc, JSValueConst *argv, int flags);
 static JSValue JS_CallConstructorInternal(JSContext *ctx,
                                           JSValueConst func_obj,
                                           JSValueConst new_target,
@@ -1547,6 +1560,25 @@ static JSValue js_dup(JSValueConst v)
     }
     return unsafe_unconst(v);
 }
+
+#ifdef USE_YK
+/* Wrappers that avoid struct-typed return values in the JIT trace.
+ * yk cannot handle struct types (e.g. {i64,i64} for JSValue) in
+ * traced code. These use out-pointers and are yk_outline so yk
+ * treats them as opaque calls without tracing into them.
+ *
+ * visibility("default") overrides -fvisibility=hidden so that dlsym
+ * can find these symbols at JIT compile time. */
+__attribute__((yk_outline, visibility("default")))
+void js_int32_yk(JSValue *dst, int32_t v) { *dst = js_int32(v); }
+__attribute__((yk_outline, visibility("default")))
+void js_float64_yk(JSValue *dst, double v) { *dst = js_float64(v); }
+__attribute__((yk_outline, visibility("default")))
+void js_bool_yk(JSValue *dst, bool v) { *dst = js_bool(v); }
+__attribute__((yk_outline, visibility("default")))
+void js_dup_yk(JSValue *dst, const JSValue *src) { *dst = js_dup(*src); }
+void set_dup_value_yk(JSContext *ctx, JSValue *pval, const JSValue *src);
+#endif
 
 JSValue JS_DupValue(JSContext *ctx, JSValueConst v)
 {
@@ -1997,6 +2029,12 @@ JSRuntime *JS_NewRuntime2(const JSMallocFunctions *mf, void *opaque)
 
     rt->current_exception = JS_UNINITIALIZED;
 
+#ifdef USE_YK
+    rt->ykmt = yk_mt_new(NULL);
+    if (!rt->ykmt)
+        goto fail;
+#endif
+
     return rt;
  fail:
     JS_FreeRuntime(rt);
@@ -2268,6 +2306,10 @@ void JS_FreeRuntime(JSRuntime *rt)
     int i;
 
     rt->in_free = true;
+#ifdef USE_YK
+    if (rt->ykmt)
+        yk_mt_shutdown(rt->ykmt);
+#endif
     JS_FreeValueRT(rt, rt->current_exception);
 
     list_for_each_safe(el, el1, &rt->job_list) {
@@ -2535,13 +2577,36 @@ void JS_SetContextOpaque(JSContext *ctx, void *opaque)
 
 /* set the new value and free the old value after (freeing the value
    can reallocate the object data) */
+#ifdef USE_YK
+__attribute__((yk_outline, visibility("default")))
+void set_value(JSContext *ctx, JSValue *pval, JSValue new_val)
+#else
 static inline void set_value(JSContext *ctx, JSValue *pval, JSValue new_val)
+#endif
 {
     JSValue old_val;
     old_val = *pval;
     *pval = new_val;
     JS_FreeValue(ctx, old_val);
 }
+
+#ifdef USE_YK
+__attribute__((yk_outline, visibility("default")))
+void set_dup_value_yk(JSContext *ctx, JSValue *pval, const JSValue *src)
+{
+    set_value(ctx, pval, js_dup(*src));
+}
+
+/* Like set_value but takes source by pointer so no struct is passed in the
+ * trace.  Ownership of *src is transferred to *dst (like set_value). */
+__attribute__((yk_outline, visibility("default")))
+void yk_set_value(JSContext *ctx, JSValue *dst, JSValue *src)
+{
+    JSValue old = *dst;
+    *dst = *src;
+    JS_FreeValue(ctx, old);
+}
+#endif
 
 void JS_SetClassProto(JSContext *ctx, JSClassID class_id, JSValue obj)
 {
@@ -17440,15 +17505,21 @@ static bool needs_backtrace(JSValue exc)
 }
 
 /* argv[] is modified if (flags & JS_CALL_FLAG_COPY_ARGV) = 0. */
-static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
-                               JSValueConst this_obj, JSValueConst new_target,
-                               int argc, JSValueConst *argv, int flags)
+JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
+                       JSValueConst this_obj, JSValueConst new_target,
+                       int argc, JSValueConst *argv, int flags)
 {
     JSRuntime *rt = caller_ctx->rt;
     JSContext *ctx;
     JSObject *p;
     JSFunctionBytecode *b;
+#ifdef USE_YK
+    JSStackFrame *sf = js_malloc_rt(rt, sizeof(JSStackFrame));
+    if (!sf) return JS_EXCEPTION;
+    JSStackFrame *sf_heap_ = sf;
+#else
     JSStackFrame sf_s, *sf = &sf_s;
+#endif
     uint8_t *pc;
     int opcode, arg_allocated_size, i;
     JSValue *local_buf, *stack_buf, *var_buf, *arg_buf, *sp, ret_val, *pval;
@@ -17480,8 +17551,12 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
 #define BREAK           SWITCH(pc)
 #endif
 
-    if (js_poll_interrupts(caller_ctx))
+    if (js_poll_interrupts(caller_ctx)) {
+#ifdef USE_YK
+        js_free_rt(rt, sf_heap_);
+#endif
         return JS_EXCEPTION;
+    }
     if (unlikely(JS_VALUE_GET_TAG(func_obj) != JS_TAG_OBJECT)) {
         if (flags & JS_CALL_FLAG_GENERATOR) {
             JSAsyncFunctionState *s = JS_VALUE_GET_PTR(func_obj);
@@ -17514,8 +17589,14 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
         call_func = rt->class_array[p->class_id].call;
         if (!call_func) {
         not_a_function:
+#ifdef USE_YK
+            js_free_rt(rt, sf_heap_);
+#endif
             return JS_ThrowTypeErrorNotAFunction(caller_ctx);
         }
+#ifdef USE_YK
+        js_free_rt(rt, sf_heap_);
+#endif
         return call_func(caller_ctx, func_obj, this_obj, argc,
                          argv, flags);
     }
@@ -17530,8 +17611,12 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
     alloca_size = sizeof(JSValue) * (arg_allocated_size + b->var_count +
                                      b->stack_size) +
         sizeof(JSVarRef *) * b->var_ref_count;
-    if (js_check_stack_overflow(rt, alloca_size))
+    if (js_check_stack_overflow(rt, alloca_size)) {
+#ifdef USE_YK
+        js_free_rt(rt, sf_heap_);
+#endif
         return JS_ThrowStackOverflow(caller_ctx);
+    }
 
     sf->is_strict_mode = b->is_strict_mode;
     arg_buf = (JSValue *)argv;
@@ -17539,7 +17624,15 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
     sf->cur_func = unsafe_unconst(func_obj);
     var_refs = p->u.func.var_refs;
 
+#ifdef USE_YK
+    local_buf = js_malloc_rt(rt, alloca_size);
+    if (unlikely(!local_buf && alloca_size != 0)) {
+        js_free_rt(rt, sf_heap_);
+        return JS_ThrowRangeError(caller_ctx, "not enough memory");
+    }
+#else
     local_buf = alloca(alloca_size);
+#endif
     if (unlikely(arg_allocated_size)) {
         int n = min_int(argc, b->arg_count);
         arg_buf = local_buf;
@@ -17579,9 +17672,17 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
         int call_argc;
         JSValue *call_argv;
 
+#ifdef USE_YK
+        if (b->yklocs)
+            yk_mt_control_point(rt->ykmt, &b->yklocs[pc - b->byte_code_buf]);
+#endif
         SWITCH(pc) {
         CASE(OP_push_i32):
+#ifdef USE_YK
+            js_int32_yk(sp++, get_u32(pc));
+#else
             *sp++ = js_int32(get_u32(pc));
+#endif
             pc += 4;
             BREAK;
         CASE(OP_push_bigint_i32):
@@ -17601,14 +17702,26 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
         CASE(OP_push_5):
         CASE(OP_push_6):
         CASE(OP_push_7):
+#ifdef USE_YK
+            js_int32_yk(sp++, opcode - OP_push_0);
+#else
             *sp++ = js_int32(opcode - OP_push_0);
+#endif
             BREAK;
         CASE(OP_push_i8):
+#ifdef USE_YK
+            js_int32_yk(sp++, get_i8(pc));
+#else
             *sp++ = js_int32(get_i8(pc));
+#endif
             pc += 1;
             BREAK;
         CASE(OP_push_i16):
+#ifdef USE_YK
+            js_int32_yk(sp++, get_i16(pc));
+#else
             *sp++ = js_int32(get_i16(pc));
+#endif
             pc += 2;
             BREAK;
         CASE(OP_push_const8):
@@ -18285,7 +18398,11 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
                 int idx;
                 idx = get_u16(pc);
                 pc += 2;
+#ifdef USE_YK
+                js_dup_yk(sp, &var_buf[idx]);
+#else
                 sp[0] = js_dup(var_buf[idx]);
+#endif
                 sp++;
             }
             BREAK;
@@ -18333,18 +18450,43 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
             }
             BREAK;
 
+#ifdef USE_YK
+        CASE(OP_get_loc8): js_dup_yk(sp++, &var_buf[*pc++]); BREAK;
+        CASE(OP_put_loc8): { uint8_t idx = *pc++; --sp; yk_set_value(ctx, &var_buf[idx], sp); } BREAK;
+        CASE(OP_set_loc8): { uint8_t idx = *pc++; set_dup_value_yk(ctx, &var_buf[idx], sp - 1); } BREAK;
+#else
         CASE(OP_get_loc8): *sp++ = js_dup(var_buf[*pc++]); BREAK;
         CASE(OP_put_loc8): set_value(ctx, &var_buf[*pc++], *--sp); BREAK;
         CASE(OP_set_loc8): set_value(ctx, &var_buf[*pc++], js_dup(sp[-1])); BREAK;
+#endif
 
         // Observation: get_loc0 and get_loc1 are individually very
         // frequent opcodes _and_ they are very often paired together,
         // making them ideal candidates for opcode fusion.
         CASE(OP_get_loc0_loc1):
+#ifdef USE_YK
+            js_dup_yk(sp++, &var_buf[0]);
+            js_dup_yk(sp++, &var_buf[1]);
+#else
             *sp++ = js_dup(var_buf[0]);
             *sp++ = js_dup(var_buf[1]);
+#endif
             BREAK;
 
+#ifdef USE_YK
+        CASE(OP_get_loc0): js_dup_yk(sp++, &var_buf[0]); BREAK;
+        CASE(OP_get_loc1): js_dup_yk(sp++, &var_buf[1]); BREAK;
+        CASE(OP_get_loc2): js_dup_yk(sp++, &var_buf[2]); BREAK;
+        CASE(OP_get_loc3): js_dup_yk(sp++, &var_buf[3]); BREAK;
+        CASE(OP_put_loc0): --sp; yk_set_value(ctx, &var_buf[0], sp); BREAK;
+        CASE(OP_put_loc1): --sp; yk_set_value(ctx, &var_buf[1], sp); BREAK;
+        CASE(OP_put_loc2): --sp; yk_set_value(ctx, &var_buf[2], sp); BREAK;
+        CASE(OP_put_loc3): --sp; yk_set_value(ctx, &var_buf[3], sp); BREAK;
+        CASE(OP_set_loc0): set_dup_value_yk(ctx, &var_buf[0], sp - 1); BREAK;
+        CASE(OP_set_loc1): set_dup_value_yk(ctx, &var_buf[1], sp - 1); BREAK;
+        CASE(OP_set_loc2): set_dup_value_yk(ctx, &var_buf[2], sp - 1); BREAK;
+        CASE(OP_set_loc3): set_dup_value_yk(ctx, &var_buf[3], sp - 1); BREAK;
+#else
         CASE(OP_get_loc0): *sp++ = js_dup(var_buf[0]); BREAK;
         CASE(OP_get_loc1): *sp++ = js_dup(var_buf[1]); BREAK;
         CASE(OP_get_loc2): *sp++ = js_dup(var_buf[2]); BREAK;
@@ -18357,6 +18499,7 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
         CASE(OP_set_loc1): set_value(ctx, &var_buf[1], js_dup(sp[-1])); BREAK;
         CASE(OP_set_loc2): set_value(ctx, &var_buf[2], js_dup(sp[-1])); BREAK;
         CASE(OP_set_loc3): set_value(ctx, &var_buf[3], js_dup(sp[-1])); BREAK;
+#endif
         CASE(OP_get_arg0): *sp++ = js_dup(arg_buf[0]); BREAK;
         CASE(OP_get_arg1): *sp++ = js_dup(arg_buf[1]); BREAK;
         CASE(OP_get_arg2): *sp++ = js_dup(arg_buf[2]); BREAK;
@@ -18369,10 +18512,17 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
         CASE(OP_set_arg1): set_value(ctx, &arg_buf[1], js_dup(sp[-1])); BREAK;
         CASE(OP_set_arg2): set_value(ctx, &arg_buf[2], js_dup(sp[-1])); BREAK;
         CASE(OP_set_arg3): set_value(ctx, &arg_buf[3], js_dup(sp[-1])); BREAK;
+#ifdef USE_YK
+        CASE(OP_get_var_ref0): js_dup_yk(sp++, var_refs[0]->pvalue); BREAK;
+        CASE(OP_get_var_ref1): js_dup_yk(sp++, var_refs[1]->pvalue); BREAK;
+        CASE(OP_get_var_ref2): js_dup_yk(sp++, var_refs[2]->pvalue); BREAK;
+        CASE(OP_get_var_ref3): js_dup_yk(sp++, var_refs[3]->pvalue); BREAK;
+#else
         CASE(OP_get_var_ref0): *sp++ = js_dup(*var_refs[0]->pvalue); BREAK;
         CASE(OP_get_var_ref1): *sp++ = js_dup(*var_refs[1]->pvalue); BREAK;
         CASE(OP_get_var_ref2): *sp++ = js_dup(*var_refs[2]->pvalue); BREAK;
         CASE(OP_get_var_ref3): *sp++ = js_dup(*var_refs[3]->pvalue); BREAK;
+#endif
         CASE(OP_put_var_ref0): set_value(ctx, var_refs[0]->pvalue, *--sp); BREAK;
         CASE(OP_put_var_ref1): set_value(ctx, var_refs[1]->pvalue, *--sp); BREAK;
         CASE(OP_put_var_ref2): set_value(ctx, var_refs[2]->pvalue, *--sp); BREAK;
@@ -18385,11 +18535,13 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
         CASE(OP_get_var_ref):
             {
                 int idx;
-                JSValue val;
                 idx = get_u16(pc);
                 pc += 2;
-                val = *var_refs[idx]->pvalue;
-                sp[0] = js_dup(val);
+#ifdef USE_YK
+                js_dup_yk(sp, var_refs[idx]->pvalue);
+#else
+                sp[0] = js_dup(*var_refs[idx]->pvalue);
+#endif
                 sp++;
             }
             BREAK;
@@ -18407,7 +18559,11 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
                 int idx;
                 idx = get_u16(pc);
                 pc += 2;
+#ifdef USE_YK
+                set_dup_value_yk(ctx, var_refs[idx]->pvalue, sp - 1);
+#else
                 set_value(ctx, var_refs[idx]->pvalue, js_dup(sp[-1]));
+#endif
             }
             BREAK;
         CASE(OP_get_var_ref_check):
@@ -18592,16 +18748,25 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
         CASE(OP_if_false):
             {
                 int res;
-                JSValue op1;
-
-                op1 = sp[-1];
                 pc += 4;
+#ifdef USE_YK
+                if ((uint32_t)JS_VALUE_GET_TAG(sp[-1]) <= JS_TAG_UNDEFINED) {
+                    res = JS_VALUE_GET_INT(sp[-1]);
+                    sp--;
+                } else {
+                    JSValue op1 = sp[-1];
+                    sp--;
+                    res = JS_ToBoolFree(ctx, op1);
+                }
+#else
+                JSValue op1 = sp[-1];
                 if ((uint32_t)JS_VALUE_GET_TAG(op1) <= JS_TAG_UNDEFINED) {
                     res = JS_VALUE_GET_INT(op1);
                 } else {
                     res = JS_ToBoolFree(ctx, op1);
                 }
                 sp--;
+#endif
                 if (!res) {
                     pc += (int32_t)get_u32(pc - 4) - 4;
                 }
@@ -18612,16 +18777,25 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
         CASE(OP_if_true8):
             {
                 int res;
-                JSValue op1;
-
-                op1 = sp[-1];
                 pc += 1;
+#ifdef USE_YK
+                if ((uint32_t)JS_VALUE_GET_TAG(sp[-1]) <= JS_TAG_UNDEFINED) {
+                    res = JS_VALUE_GET_INT(sp[-1]);
+                    sp--;
+                } else {
+                    JSValue op1 = sp[-1];
+                    sp--;
+                    res = JS_ToBoolFree(ctx, op1);
+                }
+#else
+                JSValue op1 = sp[-1];
                 if ((uint32_t)JS_VALUE_GET_TAG(op1) <= JS_TAG_UNDEFINED) {
                     res = JS_VALUE_GET_INT(op1);
                 } else {
                     res = JS_ToBoolFree(ctx, op1);
                 }
                 sp--;
+#endif
                 if (res) {
                     pc += (int8_t)pc[-1] - 1;
                 }
@@ -19352,6 +19526,27 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
 
         CASE(OP_add):
             {
+#ifdef USE_YK
+                if (likely(JS_VALUE_IS_BOTH_INT(sp[-2], sp[-1]))) {
+                    int64_t r = (int64_t)JS_VALUE_GET_INT(sp[-2]) + JS_VALUE_GET_INT(sp[-1]);
+                    if (unlikely(r < INT32_MIN || r > INT32_MAX))
+                        js_float64_yk(&sp[-2], r);
+                    else
+                        js_int32_yk(&sp[-2], r);
+                    sp--;
+                } else if (JS_VALUE_IS_BOTH_FLOAT(sp[-2], sp[-1])) {
+                    JS_X87_FPCW_SAVE_AND_ADJUST(fpcw);
+                    js_float64_yk(&sp[-2], JS_VALUE_GET_FLOAT64(sp[-2]) +
+                                           JS_VALUE_GET_FLOAT64(sp[-1]));
+                    JS_X87_FPCW_RESTORE(fpcw);
+                    sp--;
+                } else {
+                    sf->cur_pc = pc;
+                    if (js_add_slow(ctx, sp))
+                        goto exception;
+                    sp--;
+                }
+#else
                 JSValue op1, op2;
                 op1 = sp[-2];
                 op2 = sp[-1];
@@ -19375,6 +19570,7 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
                         goto exception;
                     sp--;
                 }
+#endif
             }
             BREAK;
         CASE(OP_add_loc):
@@ -19389,10 +19585,17 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
                     int64_t r;
                     r = (int64_t)JS_VALUE_GET_INT(*pv) +
                         JS_VALUE_GET_INT(sp[-1]);
+#ifdef USE_YK
+                    if (unlikely((int)r != r))
+                        js_float64_yk(pv, (double)r);
+                    else
+                        js_int32_yk(pv, (int32_t)r);
+#else
                     if (unlikely((int)r != r))
                         *pv = __JS_NewFloat64((double)r);
                     else
                         *pv = js_int32(r);
+#endif
                     sp--;
                 } else if (JS_VALUE_GET_TAG(*pv) == JS_TAG_STRING) {
                     JSValue op1;
@@ -19571,6 +19774,19 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
             BREAK;
         CASE(OP_inc):
             {
+#ifdef USE_YK
+                if (JS_VALUE_GET_TAG(sp[-1]) == JS_TAG_INT) {
+                    int val = JS_VALUE_GET_INT(sp[-1]);
+                    if (unlikely(val == INT32_MAX))
+                        goto inc_slow;
+                    js_int32_yk(&sp[-1], val + 1);
+                } else {
+                inc_slow:
+                    sf->cur_pc = pc;
+                    if (js_unary_arith_slow(ctx, sp, opcode))
+                        goto exception;
+                }
+#else
                 JSValue op1;
                 int val;
                 op1 = sp[-1];
@@ -19585,10 +19801,24 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
                     if (js_unary_arith_slow(ctx, sp, opcode))
                         goto exception;
                 }
+#endif
             }
             BREAK;
         CASE(OP_dec):
             {
+#ifdef USE_YK
+                if (JS_VALUE_GET_TAG(sp[-1]) == JS_TAG_INT) {
+                    int val = JS_VALUE_GET_INT(sp[-1]);
+                    if (unlikely(val == INT32_MIN))
+                        goto dec_slow;
+                    js_int32_yk(&sp[-1], val - 1);
+                } else {
+                dec_slow:
+                    sf->cur_pc = pc;
+                    if (js_unary_arith_slow(ctx, sp, opcode))
+                        goto exception;
+                }
+#else
                 JSValue op1;
                 int val;
                 op1 = sp[-1];
@@ -19603,6 +19833,7 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
                     if (js_unary_arith_slow(ctx, sp, opcode))
                         goto exception;
                 }
+#endif
             }
             BREAK;
         CASE(OP_post_inc):
@@ -19818,14 +20049,18 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
             BREAK;
 
 
-#define OP_CMP(opcode, binary_op, slow_call)              \
-            CASE(opcode):                                 \
-                {                                         \
-                JSValue op1, op2;                         \
-                op1 = sp[-2];                             \
-                op2 = sp[-1];                                   \
-                if (likely(JS_VALUE_IS_BOTH_INT(op1, op2))) {           \
-                    sp[-2] = js_bool(JS_VALUE_GET_INT(op1) binary_op JS_VALUE_GET_INT(op2)); \
+#ifdef USE_YK
+#define JS_BOOL_ASSIGN(ptr, v) js_bool_yk(ptr, v)
+#else
+#define JS_BOOL_ASSIGN(ptr, v) (*(ptr) = js_bool(v))
+#endif
+
+#ifdef USE_YK
+#define OP_CMP(opcode, binary_op, slow_call)                            \
+            CASE(opcode):                                               \
+                {                                                       \
+                if (likely(JS_VALUE_IS_BOTH_INT(sp[-2], sp[-1]))) {    \
+                    JS_BOOL_ASSIGN(&sp[-2], JS_VALUE_GET_INT(sp[-2]) binary_op JS_VALUE_GET_INT(sp[-1])); \
                     sp--;                                               \
                 } else {                                                \
                     sf->cur_pc = pc;                                    \
@@ -19835,6 +20070,25 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
                 }                                                       \
                 }                                                       \
             BREAK
+#else
+#define OP_CMP(opcode, binary_op, slow_call)              \
+            CASE(opcode):                                 \
+                {                                         \
+                JSValue op1, op2;                         \
+                op1 = sp[-2];                             \
+                op2 = sp[-1];                                   \
+                if (likely(JS_VALUE_IS_BOTH_INT(op1, op2))) {           \
+                    JS_BOOL_ASSIGN(&sp[-2], JS_VALUE_GET_INT(op1) binary_op JS_VALUE_GET_INT(op2)); \
+                    sp--;                                               \
+                } else {                                                \
+                    sf->cur_pc = pc;                                    \
+                    if (slow_call)                                      \
+                        goto exception;                                 \
+                    sp--;                                               \
+                }                                                       \
+                }                                                       \
+            BREAK
+#endif
 
             OP_CMP(OP_lt, <, js_relational_slow(ctx, sp, opcode));
             OP_CMP(OP_lte, <=, js_relational_slow(ctx, sp, opcode));
@@ -20140,8 +20394,14 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
         for(pval = local_buf; pval < sp; pval++) {
             JS_FreeValue(ctx, *pval);
         }
+#ifdef USE_YK
+        js_free_rt(rt, local_buf);
+#endif
     }
     rt->current_stack_frame = sf->prev_frame;
+#ifdef USE_YK
+    js_free_rt(rt, sf_heap_);
+#endif
     return ret_val;
 }
 
@@ -35583,6 +35843,58 @@ static JSValue js_create_function(JSContext *ctx, JSFunctionDef *fd)
 
     add_gc_object(ctx->rt, &b->header, JS_GC_OBJ_TYPE_FUNCTION_BYTECODE);
 
+#ifdef USE_YK
+    if (b->byte_code_len > 0) {
+        b->yklocs = js_malloc(ctx, (size_t)b->byte_code_len * sizeof(YkLocation));
+        if (b->yklocs) {
+            const uint8_t *buf = b->byte_code_buf;
+            int blen = b->byte_code_len;
+            for (int ii = 0; ii < blen; ii++)
+                b->yklocs[ii] = yk_location_null();
+            int ii = 0;
+            while (ii < blen) {
+                int op = buf[ii];
+                int len = short_opcode_info(op).size;
+                int delta = 0, target = 0, is_bkjmp = 0;
+                switch (op) {
+                case OP_goto:
+                    delta  = (int32_t)get_u32(buf + ii + 1);
+                    target = (ii + 1) + delta;
+                    is_bkjmp = (delta < 0) & (target >= 0);
+                    break;
+                case OP_goto16:
+                    delta  = (int16_t)get_u16(buf + ii + 1);
+                    target = (ii + 1) + delta;
+                    is_bkjmp = (delta < 0) & (target >= 0);
+                    break;
+                case OP_goto8:
+                    delta  = (int8_t)(buf[ii + 1]);
+                    target = (ii + 1) + delta;
+                    is_bkjmp = (delta < 0) & (target >= 0);
+                    break;
+                case OP_if_true:
+                case OP_if_false:
+                    delta  = (int32_t)get_u32(buf + ii + 1);
+                    target = (ii + 1) + delta;
+                    is_bkjmp = (delta < 0) & (target >= 0);
+                    break;
+                case OP_if_true8:
+                case OP_if_false8:
+                    delta  = (int8_t)(buf[ii + 1]);
+                    target = (ii + 1) + delta;
+                    is_bkjmp = (delta < 0) & (target >= 0);
+                    break;
+                default:
+                    break;
+                }
+                if (is_bkjmp && yk_location_is_null(b->yklocs[target]))
+                    b->yklocs[target] = yk_location_new();
+                ii += (len > 0 ? len : 1);
+            }
+        }
+    }
+#endif
+
 #ifdef ENABLE_DUMPS // JS_DUMP_BYTECODE_FINAL
     if (check_dump_flag(ctx->rt, JS_DUMP_BYTECODE_FINAL))
         js_dump_function_bytecode(ctx, b);
@@ -35628,6 +35940,16 @@ static void free_function_bytecode(JSRuntime *rt, JSFunctionBytecode *b)
     JS_FreeAtomRT(rt, b->filename);
     js_free_rt(rt, b->pc2line_buf);
     js_free_rt(rt, b->source);
+
+#ifdef USE_YK
+    if (b->yklocs) {
+        for (int ii = 0; ii < b->byte_code_len; ii++) {
+            if (!yk_location_is_null(b->yklocs[ii]))
+                yk_location_drop(b->yklocs[ii]);
+        }
+        js_free_rt(rt, b->yklocs);
+    }
+#endif
 
     remove_gc_object(&b->header);
     if (rt->gc_phase == JS_GC_PHASE_REMOVE_CYCLES && b->header.ref_count != 0) {
